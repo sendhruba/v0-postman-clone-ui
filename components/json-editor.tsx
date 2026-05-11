@@ -52,23 +52,14 @@ export function JsonEditor({ value, onChange, placeholder }: JsonEditorProps) {
   };
 
   return (
-    <div className="flex bg-secondary rounded-lg overflow-hidden border border-border focus-within:border-primary transition-colors">
-      {/* Line numbers */}
-      <div
-        id="line-numbers"
-        className="bg-muted py-3 px-2 overflow-hidden select-none flex flex-col items-end border-r border-border"
-      >
+    <div className="json-editor-wrapper">
+      <div id="line-numbers" className="line-numbers">
         {lines.map((line) => (
-          <span
-            key={line}
-            className="text-muted-foreground font-mono text-sm leading-6 h-6"
-          >
+          <span key={line} className="line-number">
             {line}
           </span>
         ))}
       </div>
-
-      {/* Textarea */}
       <textarea
         ref={textareaRef}
         value={value}
@@ -76,7 +67,7 @@ export function JsonEditor({ value, onChange, placeholder }: JsonEditorProps) {
         onKeyDown={handleKeyDown}
         onScroll={handleScroll}
         placeholder={placeholder}
-        className="flex-1 bg-transparent p-3 font-mono text-sm leading-6 resize-none focus:outline-none custom-scrollbar min-h-64 text-foreground placeholder:text-muted-foreground"
+        className="json-editor-textarea custom-scrollbar"
         spellCheck={false}
       />
     </div>
