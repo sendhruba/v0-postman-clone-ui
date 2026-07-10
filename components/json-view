@@ -1,1 +1,984 @@
+import {
+  Component,
+  ElementRef,
+  HostListener,
+  OnInit,
+  ViewChild
+} from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { FormsModule } from '@angular/forms';
 
+/* ============================================================================
+   TYPES
+   ========================================================================== */
+
+interface Token {
+  text: string;
+  cls: string | null;
+}
+
+interface JsonLine {
+  text: string;
+  path: (string | number)[];
+  depth: number;
+  tokens: Token[];
+}
+
+type RowType = 'equal' | 'changed' | 'added' | 'removed';
+
+interface DiffRow {
+  type: RowType;
+  left: JsonLine | null;
+  right: JsonLine | null;
+  leftNum: number | null;
+  rightNum: number | null;
+}
+
+interface CollapsedRow {
+  type: 'collapsed';
+  id: string;
+  count: number;
+}
+
+type RenderRow = DiffRow | CollapsedRow;
+
+interface DiffOp {
+  type: 'equal' | 'insert' | 'delete';
+  aIndex: number;
+  bIndex: number;
+}
+
+interface Stats {
+  changed: number;
+  added: number;
+  removed: number;
+  unchanged: number;
+  total: number;
+}
+
+/* ============================================================================
+   COMPONENT
+   ========================================================================== */
+
+@Component({
+  selector: 'app-json-diff-viewer',
+  standalone: true,
+  imports: [CommonModule, FormsModule],
+  templateUrl: './json-diff-viewer.component.html',
+  styleUrls: ['./json-diff-viewer.component.css']
+})
+export class JsonDiffViewerComponent implements OnInit {
+  private readonly ROW_H = 22;              // fixed row height in px -> O(1) scroll math
+  private readonly COLLAPSE_AFTER = 6;      // collapse equal-runs longer than this
+  private readonly CONTEXT_LINES = 2;       // lines of context kept around a collapsed run
+
+  /* ---------------- state ---------------- */
+  leftText = '';
+  rightText = '';
+  mode: 'edit' | 'diff' = 'diff';
+  leftError: string | null = null;
+  rightError: string | null = null;
+
+  syncScroll = true;
+  searchTerm = '';
+  hunkIdx = 0;
+  matchIdx = 0;
+  expandedRuns = new Set<string>();
+  copied = false;
+
+  rows: DiffRow[] = [];
+  renderRows: RenderRow[] = [];
+  hunks: number[] = [];
+  matches: number[] = [];
+  stats: Stats = { changed: 0, added: 0, removed: 0, unchanged: 0, total: 0 };
+  hasDiff = false;
+
+  @ViewChild('leftPane') leftPaneRef?: ElementRef<HTMLDivElement>;
+  @ViewChild('rightPane') rightPaneRef?: ElementRef<HTMLDivElement>;
+  @ViewChild('searchInput') searchInputRef?: ElementRef<HTMLInputElement>;
+  @ViewChild('leftFile') leftFileRef?: ElementRef<HTMLInputElement>;
+  @ViewChild('rightFile') rightFileRef?: ElementRef<HTMLInputElement>;
+
+  private scrollingSide: 'left' | 'right' | null = null;
+
+  private readonly sampleLeft = {
+    'Aidan Gillen': {
+      array: ['Game of Thrones', 'The Wire'],
+      string: 'some string',
+      int: '2',
+      otherint: 4,
+      aboolean: 'true',
+      booleean: false,
+      null: null,
+      a_null: 88,
+      another_null: null,
+      object: { foo: 'bar' }
+    },
+    'Amy Ryan': ['In Treatment', 'The Wire'],
+    'Annie Fitzgerald': ['True Blood', 'Big Love', 'The Sopranos', 'Oz']
+  };
+
+  private readonly sampleRight = {
+    'Aidan Gillen': {
+      array: ['Game of Thrones', 'The Wire'],
+      string: 'some string',
+      int: 2,
+      aboolean: true,
+      booleean: true,
+      null: null,
+      a_null: null,
+      another_null: 'null check',
+      object: { foo: 'bar', object1: { new_prop1: 'new prop value' } }
+    },
+    'Amy Ryan': ['In Treatment', 'The Wire'],
+    'Annie Fitzgerald': ['True Blood', 'Big Love', 'The Sopranos'],
+    'Carol Chen': { array: ['Person of Interest'] }
+  };
+
+  ngOnInit(): void {
+    this.resetSample();
+    this.recomputeDiff();
+  }
+
+  /* ============================================================================
+     PIPELINE: parse -> diff -> rows -> collapse -> hunks/matches/stats
+     ========================================================================== */
+
+  toggleMode(): void {
+    this.mode = this.mode === 'diff' ? 'edit' : 'diff';
+    if (this.mode === 'diff') this.recomputeDiff();
+  }
+
+  recomputeDiff(): void {
+    let leftParsed: unknown = undefined;
+    let rightParsed: unknown = undefined;
+
+    try {
+      leftParsed = JSON.parse(this.leftText);
+      this.leftError = null;
+    } catch (e) {
+      this.leftError = (e as Error).message;
+    }
+    try {
+      rightParsed = JSON.parse(this.rightText);
+      this.rightError = null;
+    } catch (e) {
+      this.rightError = (e as Error).message;
+    }
+
+    this.hasDiff = !this.leftError && !this.rightError;
+
+    if (!this.hasDiff) {
+      this.rows = [];
+      this.renderRows = [];
+      this.hunks = [];
+      this.matches = [];
+      this.stats = { changed: 0, added: 0, removed: 0, unchanged: 0, total: 0 };
+      return;
+    }
+
+    const leftLines = this.jsonToLines(leftParsed);
+    const rightLines = this.jsonToLines(rightParsed);
+    const ops = this.myersDiff(
+      leftLines.map(l => l.text),
+      rightLines.map(l => l.text)
+    );
+    this.rows = this.buildRows(ops, leftLines, rightLines);
+    this.expandedRuns = new Set();
+    this.hunkIdx = 0;
+    this.matchIdx = 0;
+    this.updateRenderRows();
+    this.updateStats();
+    this.updateMatches();
+  }
+
+  private updateRenderRows(): void {
+    this.renderRows = this.collapseRows(this.rows, this.expandedRuns);
+    this.updateHunks();
+  }
+
+  private updateHunks(): void {
+    const list: number[] = [];
+    let inHunk = false;
+    this.renderRows.forEach((r, i) => {
+      const isDiff = r.type === 'changed' || r.type === 'added' || r.type === 'removed';
+      if (isDiff && !inHunk) {
+        list.push(i);
+        inHunk = true;
+      } else if (!isDiff) {
+        inHunk = false;
+      }
+    });
+    this.hunks = list;
+    if (this.hunkIdx >= list.length) this.hunkIdx = 0;
+  }
+
+  private updateStats(): void {
+    let changed = 0, added = 0, removed = 0, unchanged = 0;
+    this.rows.forEach(r => {
+      if (r.type === 'changed') changed++;
+      else if (r.type === 'added') added++;
+      else if (r.type === 'removed') removed++;
+      else unchanged++;
+    });
+    this.stats = { changed, added, removed, unchanged, total: this.rows.length };
+  }
+
+  onSearchChange(): void {
+    this.updateMatches();
+  }
+
+  private updateMatches(): void {
+    if (!this.searchTerm.trim()) {
+      this.matches = [];
+      this.matchIdx = 0;
+      return;
+    }
+    const term = this.searchTerm.toLowerCase();
+    const list: number[] = [];
+    this.renderRows.forEach((r, i) => {
+      if (r.type === 'collapsed') return;
+      const l = r.left?.text?.toLowerCase() || '';
+      const rt = r.right?.text?.toLowerCase() || '';
+      if (l.includes(term) || rt.includes(term)) list.push(i);
+    });
+    this.matches = list;
+    this.matchIdx = 0;
+  }
+
+  /* ============================================================================
+     DIFF ENGINE (pure logic)
+     ========================================================================== */
+
+  private tokenizeLine(text: string): Token[] {
+    const tokens: Token[] = [];
+    const regex = /("(?:[^"\\]|\\.)*")(\s*:)|("(?:[^"\\]|\\.)*")|(-?\d+\.?\d*)|(true|false)|(null)|([{}[\]])/g;
+    let lastIndex = 0;
+    let m: RegExpExecArray | null;
+
+    while ((m = regex.exec(text)) !== null) {
+      if (m.index > lastIndex) {
+        tokens.push({ text: text.slice(lastIndex, m.index), cls: null });
+      }
+      if (m[1] !== undefined) {
+        tokens.push({ text: m[1], cls: 'jd-key' });
+        tokens.push({ text: m[2], cls: null });
+      } else if (m[3] !== undefined) {
+        tokens.push({ text: m[3], cls: 'jd-str' });
+      } else if (m[4] !== undefined) {
+        tokens.push({ text: m[4], cls: 'jd-num' });
+      } else if (m[5] !== undefined) {
+        tokens.push({ text: m[5], cls: 'jd-bool' });
+      } else if (m[6] !== undefined) {
+        tokens.push({ text: m[6], cls: 'jd-null' });
+      } else if (m[7] !== undefined) {
+        const isClosing = m[7] === '}' || m[7] === ']';
+        const beforeIsWhitespace = /^\s*$/.test(text.slice(0, m.index));
+        tokens.push({ text: m[7], cls: isClosing && beforeIsWhitespace ? 'jd-brace' : null });
+      }
+      lastIndex = regex.lastIndex;
+    }
+    if (lastIndex < text.length) {
+      tokens.push({ text: text.slice(lastIndex), cls: null });
+    }
+    return tokens;
+  }
+
+  // Recursively turn a JSON value into an array of {text, path, depth, tokens}
+  // lines, formatted exactly like JSON.stringify(value, null, 2).
+  private jsonToLines(value: unknown): JsonLine[] {
+    const lines: JsonLine[] = [];
+    const push = (text: string, path: (string | number)[], depth: number) => {
+      lines.push({ text, path, depth, tokens: this.tokenizeLine(text) });
+    };
+
+    const walk = (
+      val: any,
+      depth: number,
+      path: (string | number)[],
+      isLast: boolean,
+      key: string | number | undefined
+    ): void => {
+      const indent = '  '.repeat(depth);
+      const keyStr = key !== undefined ? `"${key}": ` : '';
+      const comma = isLast ? '' : ',';
+
+      if (val === null || typeof val !== 'object') {
+        push(`${indent}${keyStr}${JSON.stringify(val)}${comma}`, path, depth);
+        return;
+      }
+      const isArray = Array.isArray(val);
+      const entries: [string | number, any][] = isArray
+        ? val.map((v: any, i: number) => [i, v])
+        : Object.entries(val);
+
+      if (entries.length === 0) {
+        push(`${indent}${keyStr}${isArray ? '[]' : '{}'}${comma}`, path, depth);
+        return;
+      }
+
+      push(`${indent}${keyStr}${isArray ? '[' : '{'}`, path, depth);
+      entries.forEach(([k, v], idx) => {
+        const childIsLast = idx === entries.length - 1;
+        const childPath = [...path, k];
+        walk(v, depth + 1, childPath, childIsLast, isArray ? undefined : k);
+      });
+      push(`${indent}${isArray ? ']' : '}'}${comma}`, path, depth);
+    };
+
+    walk(value, 0, [], true, undefined);
+    return lines;
+  }
+
+  // Myers O(ND) diff over two arrays of strings.
+  private myersDiff(a: string[], b: string[]): DiffOp[] {
+    const N = a.length, M = b.length;
+    const MAX = N + M || 1;
+    const v: Record<number, number> = { 1: 0 };
+    const trace: Record<number, number>[] = [];
+
+    const backtrack = (trace: Record<number, number>[], N: number, M: number): DiffOp[] => {
+      let x = N, y = M;
+      const ops: DiffOp[] = [];
+      for (let d = trace.length - 1; d >= 0; d--) {
+        const vv = trace[d];
+        const k = x - y;
+        const prevK = (k === -d || (k !== d && vv[k - 1] < vv[k + 1])) ? k + 1 : k - 1;
+        const prevX = vv[prevK];
+        const prevY = prevX - prevK;
+        while (x > prevX && y > prevY) {
+          ops.push({ type: 'equal', aIndex: x - 1, bIndex: y - 1 });
+          x--; y--;
+        }
+        if (d > 0) {
+          if (x === prevX) ops.push({ type: 'insert', aIndex: -1, bIndex: prevY });
+          else ops.push({ type: 'delete', aIndex: prevX, bIndex: -1 });
+        }
+        x = prevX; y = prevY;
+      }
+      return ops.reverse();
+    };
+
+    for (let d = 0; d <= MAX; d++) {
+      trace.push({ ...v });
+      for (let k = -d; k <= d; k += 2) {
+        let x: number;
+        if (k === -d || (k !== d && v[k - 1] < v[k + 1])) x = v[k + 1];
+        else x = v[k - 1] + 1;
+        let y = x - k;
+        while (x < N && y < M && a[x] === b[y]) { x++; y++; }
+        v[k] = x;
+        if (x >= N && y >= M) return backtrack(trace, N, M);
+      }
+    }
+    return backtrack(trace, N, M);
+  }
+
+  // Turn the flat op list into aligned rows. 'changed' rows pair a delete+
+  // insert at the same position; leftovers become 'removed'/'added' rows.
+  private buildRows(ops: DiffOp[], leftLines: JsonLine[], rightLines: JsonLine[]): DiffRow[] {
+    const rows: DiffRow[] = [];
+    let delBuf: DiffOp[] = [];
+    let insBuf: DiffOp[] = [];
+
+    const flush = () => {
+      const pairCount = Math.min(delBuf.length, insBuf.length);
+      for (let i = 0; i < pairCount; i++) {
+        rows.push({
+          type: 'changed',
+          left: leftLines[delBuf[i].aIndex],
+          right: rightLines[insBuf[i].bIndex],
+          leftNum: null, rightNum: null
+        });
+      }
+      for (let i = pairCount; i < delBuf.length; i++) {
+        rows.push({ type: 'removed', left: leftLines[delBuf[i].aIndex], right: null, leftNum: null, rightNum: null });
+      }
+      for (let i = pairCount; i < insBuf.length; i++) {
+        rows.push({ type: 'added', left: null, right: rightLines[insBuf[i].bIndex], leftNum: null, rightNum: null });
+      }
+      delBuf = []; insBuf = [];
+    };
+
+    for (const op of ops) {
+      if (op.type === 'equal') {
+        flush();
+        rows.push({
+          type: 'equal',
+          left: leftLines[op.aIndex],
+          right: rightLines[op.bIndex],
+          leftNum: null, rightNum: null
+        });
+      } else if (op.type === 'delete') {
+        delBuf.push(op);
+      } else {
+        insBuf.push(op);
+      }
+    }
+    flush();
+
+    let ln = 0, rn = 0;
+    for (const row of rows) {
+      row.leftNum = row.left ? ++ln : null;
+      row.rightNum = row.right ? ++rn : null;
+    }
+    return rows;
+  }
+
+  // Collapse long equal-runs into a single marker row (unless expanded).
+  private collapseRows(rows: DiffRow[], expandedRuns: Set<string>): RenderRow[] {
+    const out: RenderRow[] = [];
+    let i = 0;
+    while (i < rows.length) {
+      if (rows[i].type === 'equal') {
+        let j = i;
+        while (j < rows.length && rows[j].type === 'equal') j++;
+        const runLen = j - i;
+        const id = `run-${i}`;
+        if (runLen > this.COLLAPSE_AFTER && !expandedRuns.has(id)) {
+          for (let c = 0; c < this.CONTEXT_LINES; c++) out.push(rows[i + c]);
+          out.push({ type: 'collapsed', id, count: runLen - this.CONTEXT_LINES * 2 });
+          for (let c = runLen - this.CONTEXT_LINES; c < runLen; c++) out.push(rows[i + c]);
+        } else {
+          for (let c = i; c < j; c++) out.push(rows[c]);
+        }
+        i = j;
+      } else {
+        out.push(rows[i]);
+        i++;
+      }
+    }
+    return out;
+  }
+
+  /* ============================================================================
+     UI HELPERS
+     ========================================================================== */
+
+  isCollapsed(row: RenderRow): row is CollapsedRow {
+    return row.type === 'collapsed';
+  }
+
+  trackByIndex(index: number): number {
+    return index;
+  }
+
+  rowClass(row: RenderRow, idx: number, side: 'left' | 'right'): string {
+    if (row.type === 'collapsed') return '';
+    const r = row as DiffRow;
+    let cls = 'jd-row';
+    if (r.type === 'equal') cls += ' jd-row-equal';
+    if (r.type === 'changed') cls += side === 'left' ? ' jd-row-removed jd-row-changed' : ' jd-row-added jd-row-changed';
+    if (r.type === 'removed') cls += side === 'left' ? ' jd-row-removed' : ' jd-row-blank';
+    if (r.type === 'added') cls += side === 'right' ? ' jd-row-added' : ' jd-row-blank';
+    if (this.hunks[this.hunkIdx] === idx && r.type !== 'equal') cls += ' jd-row-hunk-active';
+    if (this.matches[this.matchIdx] === idx) cls += ' jd-row-match-active';
+    return cls;
+  }
+
+  cellOf(row: RenderRow, side: 'left' | 'right'): JsonLine | null {
+    if (row.type === 'collapsed') return null;
+    const r = row as DiffRow;
+    return side === 'left' ? r.left : r.right;
+  }
+
+  numOf(row: RenderRow, side: 'left' | 'right'): number | null {
+    if (row.type === 'collapsed') return null;
+    const r = row as DiffRow;
+    return side === 'left' ? r.leftNum : r.rightNum;
+  }
+
+  expandRun(id: string): void {
+    this.expandedRuns.add(id);
+    this.updateRenderRows();
+  }
+
+  get currentHunkPath(): string {
+    const row = this.renderRows[this.hunks[this.hunkIdx]];
+    if (!row || row.type === 'collapsed') return '';
+    const r = row as DiffRow;
+    const path = (r.left || r.right)?.path;
+    return path && path.length ? path.join(' \u203a ') : 'root';
+  }
+
+  /* ============================================================================
+     NAVIGATION & SCROLL SYNC
+     ========================================================================== */
+
+  private scrollBothTo(rowIndex: number): void {
+    const target = Math.max(0, rowIndex * this.ROW_H - 60);
+    if (this.leftPaneRef) this.leftPaneRef.nativeElement.scrollTop = target;
+    if (this.rightPaneRef) this.rightPaneRef.nativeElement.scrollTop = target;
+  }
+
+  gotoHunk(dir: number): void {
+    if (this.hunks.length === 0) return;
+    this.hunkIdx = (this.hunkIdx + dir + this.hunks.length) % this.hunks.length;
+    this.scrollBothTo(this.hunks[this.hunkIdx]);
+  }
+
+  gotoMatch(dir: number): void {
+    if (this.matches.length === 0) return;
+    this.matchIdx = (this.matchIdx + dir + this.matches.length) % this.matches.length;
+    this.scrollBothTo(this.matches[this.matchIdx]);
+  }
+
+  onSearchKeydown(e: KeyboardEvent): void {
+    if (e.key === 'Enter') this.gotoMatch(e.shiftKey ? -1 : 1);
+  }
+
+  onScroll(side: 'left' | 'right'): void {
+    if (!this.syncScroll) return;
+    if (this.scrollingSide && this.scrollingSide !== side) return;
+    this.scrollingSide = side;
+    const source = side === 'left' ? this.leftPaneRef : this.rightPaneRef;
+    const target = side === 'left' ? this.rightPaneRef : this.leftPaneRef;
+    if (source && target) target.nativeElement.scrollTop = source.nativeElement.scrollTop;
+    requestAnimationFrame(() => { this.scrollingSide = null; });
+  }
+
+  @HostListener('window:keydown', ['$event'])
+  handleGlobalKeydown(e: KeyboardEvent): void {
+    const target = e.target as HTMLElement;
+    const typing = target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA');
+    if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
+      e.preventDefault();
+      this.searchInputRef?.nativeElement.focus();
+    } else if (this.mode === 'diff' && !e.ctrlKey && !e.metaKey && !typing) {
+      if (e.key === 'n') this.gotoHunk(1);
+      if (e.key === 'p') this.gotoHunk(-1);
+    }
+  }
+
+  /* ============================================================================
+     FILE / EXPORT / MISC ACTIONS
+     ========================================================================== */
+
+  triggerUpload(side: 'left' | 'right'): void {
+    const ref = side === 'left' ? this.leftFileRef : this.rightFileRef;
+    ref?.nativeElement.click();
+  }
+
+  handleFile(side: 'left' | 'right', event: Event): void {
+    const input = event.target as HTMLInputElement;
+    const file = input.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const text = String(ev.target?.result ?? '');
+      try {
+        const parsed = JSON.parse(text);
+        const pretty = JSON.stringify(parsed, null, 2);
+        if (side === 'left') this.leftText = pretty; else this.rightText = pretty;
+      } catch {
+        if (side === 'left') this.leftText = text; else this.rightText = text;
+      }
+    };
+    reader.readAsText(file);
+    input.value = '';
+  }
+
+  async handleCopy(): Promise<void> {
+    try {
+      await navigator.clipboard.writeText(this.rightText);
+      this.copied = true;
+      setTimeout(() => (this.copied = false), 1500);
+    } catch {
+      /* clipboard unavailable */
+    }
+  }
+
+  handleDownload(): void {
+    const report = this.renderRows
+      .filter((r): r is DiffRow => r.type !== 'equal' && r.type !== 'collapsed')
+      .map(r => {
+        if (r.type === 'changed') return `~ ${r.left!.text.trim()}  ->  ${r.right!.text.trim()}`;
+        if (r.type === 'removed') return `- ${r.left!.text.trim()}`;
+        return `+ ${r.right!.text.trim()}`;
+      })
+      .join('\n');
+    const blob = new Blob([report], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'json-diff-report.txt';
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  formatBoth(): void {
+    try { this.leftText = JSON.stringify(JSON.parse(this.leftText), null, 2); } catch { /* keep as-is */ }
+    try { this.rightText = JSON.stringify(JSON.parse(this.rightText), null, 2); } catch { /* keep as-is */ }
+  }
+
+  resetSample(): void {
+    this.leftText = JSON.stringify(this.sampleLeft, null, 2);
+    this.rightText = JSON.stringify(this.sampleRight, null, 2);
+  }
+}
+
+
+
+
+<!-- ============================================================
+     REUSABLE ICONS (lucide-style outline svgs, no external deps)
+     ============================================================ -->
+<ng-template #iconSearch><svg viewBox="0 0 24 24" class="jd-icon"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg></ng-template>
+<ng-template #iconCopy><svg viewBox="0 0 24 24" class="jd-icon"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg></ng-template>
+<ng-template #iconDownload><svg viewBox="0 0 24 24" class="jd-icon"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg></ng-template>
+<ng-template #iconChevronUp><svg viewBox="0 0 24 24" class="jd-icon"><polyline points="18 15 12 9 6 15"></polyline></svg></ng-template>
+<ng-template #iconChevronDown><svg viewBox="0 0 24 24" class="jd-icon"><polyline points="6 9 12 15 18 9"></polyline></svg></ng-template>
+<ng-template #iconChevronRight><svg viewBox="0 0 24 24" class="jd-icon"><polyline points="9 18 15 12 9 6"></polyline></svg></ng-template>
+<ng-template #iconLink><svg viewBox="0 0 24 24" class="jd-icon"><path d="M15 7h3a5 5 0 0 1 0 10h-3"></path><path d="M9 17H6a5 5 0 0 1 0-10h3"></path><line x1="8" y1="12" x2="16" y2="12"></line></svg></ng-template>
+<ng-template #iconUnlink><svg viewBox="0 0 24 24" class="jd-icon"><path d="M15 7h3a5 5 0 0 1 4.24 7.66"></path><path d="M9 17H6a5 5 0 0 1-4.24-7.66"></path><line x1="8" y1="12" x2="10" y2="12"></line><line x1="14" y1="12" x2="16" y2="12"></line></svg></ng-template>
+<ng-template #iconUpload><svg viewBox="0 0 24 24" class="jd-icon"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg></ng-template>
+<ng-template #iconFileJson><svg viewBox="0 0 24 24" class="jd-icon"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline></svg></ng-template>
+<ng-template #iconCheck><svg viewBox="0 0 24 24" class="jd-icon"><polyline points="20 6 9 17 4 12"></polyline></svg></ng-template>
+<ng-template #iconAlert><svg viewBox="0 0 24 24" class="jd-icon"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg></ng-template>
+<ng-template #iconReset><svg viewBox="0 0 24 24" class="jd-icon"><path d="M3 2v6h6"></path><path d="M3.51 15a9 9 0 1 0 2.13-9.36L3 8"></path></svg></ng-template>
+
+<div class="jd-root">
+
+  <!-- ===== TOOLBAR ===== -->
+  <div class="jd-toolbar">
+    <div class="jd-title">
+      <ng-container *ngTemplateOutlet="iconFileJson"></ng-container>
+      JSON Compare
+    </div>
+
+    <button class="jd-btn" [class.active]="mode === 'diff'" (click)="toggleMode()">
+      <ng-container *ngIf="mode === 'diff'"><ng-container *ngTemplateOutlet="iconCheck"></ng-container></ng-container>
+      Compare
+    </button>
+
+    <ng-container *ngIf="mode === 'edit'">
+      <button class="jd-btn" (click)="formatBoth()">Format</button>
+      <button class="jd-btn" (click)="resetSample()">
+        <ng-container *ngTemplateOutlet="iconReset"></ng-container> Sample
+      </button>
+    </ng-container>
+
+    <ng-container *ngIf="mode === 'diff'">
+      <div class="jd-search-wrap">
+        <span class="jd-search-icon"><ng-container *ngTemplateOutlet="iconSearch"></ng-container></span>
+        <input
+          #searchInput
+          placeholder="Search (Ctrl+F)..."
+          [(ngModel)]="searchTerm"
+          (ngModelChange)="onSearchChange()"
+          (keydown)="onSearchKeydown($event)"
+        />
+      </div>
+      <span class="jd-match-count" *ngIf="searchTerm">
+        {{ matches.length ? (matchIdx + 1) + '/' + matches.length : '0 found' }}
+      </span>
+      <ng-container *ngIf="searchTerm && matches.length > 0">
+        <button class="jd-btn jd-btn-icon" (click)="gotoMatch(-1)" title="Previous match">
+          <ng-container *ngTemplateOutlet="iconChevronUp"></ng-container>
+        </button>
+        <button class="jd-btn jd-btn-icon" (click)="gotoMatch(1)" title="Next match">
+          <ng-container *ngTemplateOutlet="iconChevronDown"></ng-container>
+        </button>
+      </ng-container>
+
+      <button class="jd-btn" [class.active]="syncScroll" (click)="syncScroll = !syncScroll" title="Keep both panels scrolled together">
+        <ng-container *ngTemplateOutlet="syncScroll ? iconLink : iconUnlink"></ng-container> Sync
+      </button>
+      <button class="jd-btn" (click)="handleCopy()">
+        <ng-container *ngTemplateOutlet="copied ? iconCheck : iconCopy"></ng-container> {{ copied ? 'Copied' : 'Copy' }}
+      </button>
+      <button class="jd-btn" (click)="handleDownload()">
+        <ng-container *ngTemplateOutlet="iconDownload"></ng-container> Export
+      </button>
+    </ng-container>
+
+    <div class="jd-stats" *ngIf="hasDiff">
+      <div class="jd-stat jd-stat-total"><b>{{ stats.total }}</b><span>Lines</span></div>
+      <div class="jd-stat jd-stat-changed"><b>{{ stats.changed }}</b><span>Changed</span></div>
+      <div class="jd-stat jd-stat-added"><b>{{ stats.added }}</b><span>Added</span></div>
+      <div class="jd-stat jd-stat-removed"><b>{{ stats.removed }}</b><span>Removed</span></div>
+    </div>
+  </div>
+
+  <!-- ===== DIFF NAVIGATION BAR ===== -->
+  <div class="jd-nav-bar" *ngIf="mode === 'diff' && hasDiff">
+    <button class="jd-btn" (click)="gotoHunk(-1)" [disabled]="hunks.length === 0">
+      <ng-container *ngTemplateOutlet="iconChevronUp"></ng-container> Prev diff
+    </button>
+    <button class="jd-btn" (click)="gotoHunk(1)" [disabled]="hunks.length === 0">
+      <ng-container *ngTemplateOutlet="iconChevronDown"></ng-container> Next diff
+    </button>
+    <span class="jd-hunk-count">
+      {{ hunks.length ? ('Difference ' + (hunkIdx + 1) + ' of ' + hunks.length) : 'No differences found' }}
+    </span>
+    <span class="jd-hunk-count" style="margin-left: auto">{{ currentHunkPath }}</span>
+  </div>
+
+  <!-- ===== ERROR BAR ===== -->
+  <div class="jd-error-bar" *ngIf="(leftError || rightError) && mode === 'diff'">
+    <ng-container *ngTemplateOutlet="iconAlert"></ng-container>
+    {{ leftError ? ('Left JSON error: ' + leftError) : ('Right JSON error: ' + rightError) }} — switch to Edit mode to fix it.
+  </div>
+
+  <!-- ===== MAIN PANES ===== -->
+  <div class="jd-panes">
+
+    <!-- LEFT / ORIGINAL -->
+    <div class="jd-pane">
+      <div class="jd-pane-header">
+        <span>Original</span>
+        <label class="jd-upload" *ngIf="mode === 'edit'" (click)="triggerUpload('left')">
+          <ng-container *ngTemplateOutlet="iconUpload"></ng-container> Upload
+        </label>
+        <input #leftFile type="file" accept=".json,application/json" style="display:none" (change)="handleFile('left', $event)" />
+      </div>
+
+      <textarea *ngIf="mode === 'edit'" spellcheck="false" [(ngModel)]="leftText"></textarea>
+
+      <div class="jd-pane-body" #leftPane (scroll)="onScroll('left')" *ngIf="mode === 'diff'">
+        <ng-container *ngIf="hasDiff; else leftNoData">
+          <ng-container *ngFor="let row of renderRows; let idx = index; trackBy: trackByIndex">
+            <div *ngIf="isCollapsed(row)" class="jd-collapsed-row" [style.height.px]="22" (click)="expandRun(row.id)">
+              <span class="jd-collapsed-pill">
+                <ng-container *ngTemplateOutlet="iconChevronRight"></ng-container>
+                {{ row.count }} unchanged line{{ row.count === 1 ? '' : 's' }}
+              </span>
+            </div>
+            <div *ngIf="!isCollapsed(row)" [class]="rowClass(row, idx, 'left')" [style.height.px]="22">
+              <span class="jd-lineno">{{ numOf(row, 'left') }}</span>
+              <span class="jd-code">
+                <ng-container *ngIf="cellOf(row, 'left') as cell; else blankFill">
+                  <span *ngFor="let seg of cell.tokens" [class]="seg.cls">{{ seg.text }}</span>
+                </ng-container>
+                <ng-template #blankFill><span class="jd-blank-fill">&nbsp;</span></ng-template>
+              </span>
+            </div>
+          </ng-container>
+        </ng-container>
+        <ng-template #leftNoData>
+          <div class="jd-empty-msg">Fix JSON errors to see the comparison.</div>
+        </ng-template>
+      </div>
+    </div>
+
+    <!-- RIGHT / MODIFIED -->
+    <div class="jd-pane">
+      <div class="jd-pane-header">
+        <span>Modified</span>
+        <label class="jd-upload" *ngIf="mode === 'edit'" (click)="triggerUpload('right')">
+          <ng-container *ngTemplateOutlet="iconUpload"></ng-container> Upload
+        </label>
+        <input #rightFile type="file" accept=".json,application/json" style="display:none" (change)="handleFile('right', $event)" />
+      </div>
+
+      <textarea *ngIf="mode === 'edit'" spellcheck="false" [(ngModel)]="rightText"></textarea>
+
+      <div class="jd-pane-body" #rightPane (scroll)="onScroll('right')" *ngIf="mode === 'diff'">
+        <ng-container *ngIf="hasDiff; else rightNoData">
+          <ng-container *ngFor="let row of renderRows; let idx = index; trackBy: trackByIndex">
+            <div *ngIf="isCollapsed(row)" class="jd-collapsed-row" [style.height.px]="22" (click)="expandRun(row.id)">
+              <span class="jd-collapsed-pill">
+                <ng-container *ngTemplateOutlet="iconChevronRight"></ng-container>
+                {{ row.count }} unchanged line{{ row.count === 1 ? '' : 's' }}
+              </span>
+            </div>
+            <div *ngIf="!isCollapsed(row)" [class]="rowClass(row, idx, 'right')" [style.height.px]="22">
+              <span class="jd-lineno">{{ numOf(row, 'right') }}</span>
+              <span class="jd-code">
+                <ng-container *ngIf="cellOf(row, 'right') as cell; else blankFillR">
+                  <span *ngFor="let seg of cell.tokens" [class]="seg.cls">{{ seg.text }}</span>
+                </ng-container>
+                <ng-template #blankFillR><span class="jd-blank-fill">&nbsp;</span></ng-template>
+              </span>
+            </div>
+          </ng-container>
+        </ng-container>
+        <ng-template #rightNoData>
+          <div class="jd-empty-msg">Fix JSON errors to see the comparison.</div>
+        </ng-template>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== FOOTER ===== -->
+  <div class="jd-footer">
+    <ng-container *ngIf="mode === 'diff'; else editFooter">
+      <span><kbd>n</kbd> / <kbd>p</kbd> next / prev diff</span>
+      <span><kbd>Ctrl+F</kbd> search</span>
+      <span class="jd-legend"><span class="jd-swatch jd-swatch-removed"></span> removed</span>
+      <span class="jd-legend"><span class="jd-swatch jd-swatch-added"></span> added / changed</span>
+      <span style="margin-left: auto">Click a collapsed block to expand it</span>
+    </ng-container>
+    <ng-template #editFooter>
+      <span>Paste or upload JSON on each side, then click <b>Compare</b>.</span>
+    </ng-template>
+  </div>
+
+</div>
+
+
+:host {
+  display: block;
+  height: 100%;
+}
+
+.jd-root {
+  --jd-bg: #ffffff;
+  --jd-bg-alt: #f7f8fa;
+  --jd-border: #e2e5ea;
+  --jd-text: #1f2430;
+  --jd-muted: #7c8394;
+  --jd-accent: #3b6fe0;
+  --jd-accent-soft: #eaf0ff;
+  --jd-red-bg: #fdecec;
+  --jd-red-border: #f3a9a9;
+  --jd-red-text: #b3261e;
+  --jd-green-bg: #e9f9ee;
+  --jd-green-border: #9bd8ac;
+  --jd-green-text: #1b7a3d;
+  --jd-key: #a6178f;
+  --jd-str: #1a8a5f;
+  --jd-num: #b5750a;
+  --jd-bool: #2266c9;
+  --jd-null: #8a8f9c;
+  --jd-brace: #626a7a;
+
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  background: var(--jd-bg);
+  color: var(--jd-text);
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 640px;
+  border: 1px solid var(--jd-border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+/* ---------- icons ---------- */
+.jd-icon {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  vertical-align: -2px;
+}
+.jd-title .jd-icon { width: 16px; height: 16px; }
+
+/* ---------- toolbar ---------- */
+.jd-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--jd-border);
+  background: var(--jd-bg-alt);
+  flex-wrap: wrap;
+}
+.jd-title { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 13.5px; color: var(--jd-text); margin-right: 6px; }
+.jd-btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  border: 1px solid var(--jd-border); background: var(--jd-bg);
+  color: var(--jd-text); font-size: 12.5px; font-weight: 500;
+  padding: 6px 10px; border-radius: 6px; cursor: pointer;
+  transition: background .12s, border-color .12s;
+}
+.jd-btn:hover { background: var(--jd-bg-alt); border-color: #c9cedb; }
+.jd-btn:disabled { opacity: .4; cursor: not-allowed; }
+.jd-btn.active { background: var(--jd-accent); border-color: var(--jd-accent); color: #fff; }
+.jd-btn-icon { padding: 6px; }
+
+.jd-search-wrap { position: relative; flex: 1; min-width: 180px; max-width: 320px; }
+.jd-search-wrap input {
+  width: 100%; padding: 6px 10px 6px 30px; border: 1px solid var(--jd-border);
+  border-radius: 6px; font-size: 12.5px; background: var(--jd-bg); color: var(--jd-text);
+  box-sizing: border-box;
+}
+.jd-search-wrap input:focus { outline: 2px solid var(--jd-accent-soft); border-color: var(--jd-accent); }
+.jd-search-icon { position: absolute; left: 9px; top: 50%; transform: translateY(-50%); color: var(--jd-muted); display: flex; }
+.jd-match-count { font-size: 11.5px; color: var(--jd-muted); white-space: nowrap; }
+
+.jd-stats { display: flex; gap: 6px; margin-left: auto; }
+.jd-stat { display: flex; flex-direction: column; align-items: center; padding: 4px 10px; border-radius: 6px; min-width: 52px; }
+.jd-stat b { font-size: 15px; line-height: 1.1; }
+.jd-stat span { font-size: 9.5px; color: var(--jd-muted); text-transform: uppercase; letter-spacing: .04em; }
+.jd-stat-changed { background: #fff6e6; } .jd-stat-changed b { color: #b5750a; }
+.jd-stat-added { background: var(--jd-green-bg); } .jd-stat-added b { color: var(--jd-green-text); }
+.jd-stat-removed { background: var(--jd-red-bg); } .jd-stat-removed b { color: var(--jd-red-text); }
+.jd-stat-total { background: var(--jd-accent-soft); } .jd-stat-total b { color: var(--jd-accent); }
+
+/* ---------- diff nav bar ---------- */
+.jd-nav-bar {
+  display: flex; align-items: center; gap: 8px; padding: 6px 14px;
+  border-bottom: 1px solid var(--jd-border); background: var(--jd-bg); font-size: 12px;
+}
+.jd-nav-bar .jd-btn { padding: 4px 8px; }
+.jd-hunk-count { color: var(--jd-muted); font-variant-numeric: tabular-nums; }
+
+/* ---------- error bar ---------- */
+.jd-error-bar {
+  padding: 8px 14px; background: var(--jd-red-bg); color: var(--jd-red-text); font-size: 12.5px;
+  display: flex; gap: 6px; align-items: center; border-bottom: 1px solid var(--jd-red-border);
+}
+
+/* ---------- panes ---------- */
+.jd-panes { flex: 1; display: flex; overflow: hidden; min-height: 0; }
+.jd-pane { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.jd-pane + .jd-pane { border-left: 1px solid var(--jd-border); }
+.jd-pane-header {
+  padding: 8px 14px; font-size: 12px; font-weight: 600; color: var(--jd-muted);
+  background: var(--jd-bg-alt); border-bottom: 1px solid var(--jd-border);
+  display: flex; justify-content: space-between; align-items: center;
+}
+.jd-pane-header label.jd-upload { cursor: pointer; color: var(--jd-accent); display: inline-flex; align-items: center; gap: 4px; font-weight: 500; }
+.jd-pane-body { flex: 1; overflow: auto; font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace; font-size: 12.5px; }
+.jd-pane textarea {
+  flex: 1; width: 100%; border: none; resize: none; padding: 12px 14px; box-sizing: border-box;
+  font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace; font-size: 12.5px;
+  background: var(--jd-bg); color: var(--jd-text); outline: none; line-height: 1.6;
+}
+.jd-empty-msg { padding: 16px; color: var(--jd-muted); font-size: 12.5px; font-family: ui-sans-serif, system-ui, sans-serif; }
+
+/* ---------- rows ---------- */
+.jd-row { display: flex; align-items: center; white-space: pre; cursor: default; width: max-content; min-width: 100%; }
+.jd-lineno { width: 44px; flex-shrink: 0; text-align: right; padding-right: 10px; color: var(--jd-muted); font-size: 11px; user-select: none; }
+.jd-code { flex: 0 0 auto; padding-right: 24px; }
+.jd-row-equal:hover { background: var(--jd-bg-alt); }
+.jd-row-removed { background: var(--jd-red-bg); border-left: 3px solid var(--jd-red-border); }
+.jd-row-removed .jd-lineno { color: var(--jd-red-text); }
+.jd-row-added { background: var(--jd-green-bg); border-left: 3px solid var(--jd-green-border); }
+.jd-row-added .jd-lineno { color: var(--jd-green-text); }
+.jd-row-blank { background: repeating-linear-gradient(135deg, var(--jd-bg-alt), var(--jd-bg-alt) 4px, #eef0f4 4px, #eef0f4 8px); border-left: 3px solid transparent; }
+.jd-row-hunk-active { box-shadow: inset 0 0 0 2px var(--jd-accent); }
+.jd-row-match-active { box-shadow: inset 0 0 0 2px #d99a1e; }
+.jd-blank-fill { opacity: 0; }
+
+.jd-collapsed-row { display: flex; align-items: center; justify-content: center; background: var(--jd-bg-alt); cursor: pointer; border-top: 1px dashed var(--jd-border); border-bottom: 1px dashed var(--jd-border); }
+.jd-collapsed-row:hover .jd-collapsed-pill { background: var(--jd-accent); color: #fff; }
+.jd-collapsed-pill { display: inline-flex; align-items: center; gap: 4px; font-size: 10.5px; color: var(--jd-muted); background: var(--jd-bg); border: 1px solid var(--jd-border); border-radius: 999px; padding: 1px 9px; transition: background .12s, color .12s; }
+.jd-collapsed-pill .jd-icon { width: 11px; height: 11px; }
+
+/* ---------- json syntax colors ---------- */
+.jd-code .jd-key { color: var(--jd-key); }
+.jd-code .jd-str { color: var(--jd-str); }
+.jd-code .jd-num { color: var(--jd-num); }
+.jd-code .jd-bool { color: var(--jd-bool); font-weight: 600; }
+.jd-code .jd-null { color: var(--jd-null); font-style: italic; }
+.jd-code .jd-brace { color: var(--jd-brace); }
+
+/* ---------- footer ---------- */
+.jd-footer { display: flex; align-items: center; gap: 18px; padding: 7px 14px; border-top: 1px solid var(--jd-border); background: var(--jd-bg-alt); font-size: 11px; color: var(--jd-muted); }
+.jd-footer kbd { background: #fff; border: 1px solid var(--jd-border); border-radius: 4px; padding: 1px 6px; font-family: inherit; color: var(--jd-text); }
+.jd-legend { display: flex; align-items: center; gap: 5px; }
+.jd-swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+.jd-swatch-removed { background: var(--jd-red-bg); border: 1px solid var(--jd-red-border); }
+.jd-swatch-added { background: var(--jd-green-bg); border: 1px solid var(--jd-green-border); }
+
+/* ---------- scrollbars ---------- */
+.jd-pane-body::-webkit-scrollbar, .jd-pane textarea::-webkit-scrollbar { width: 10px; height: 10px; }
+.jd-pane-body::-webkit-scrollbar-thumb { background: #d3d7e0; border-radius: 6px; border: 2px solid var(--jd-bg); }
+.jd-pane-body::-webkit-scrollbar-track { background: transparent; }
