@@ -982,3 +982,1458 @@ export class JsonDiffViewerComponent implements OnInit {
 .jd-pane-body::-webkit-scrollbar, .jd-pane textarea::-webkit-scrollbar { width: 10px; height: 10px; }
 .jd-pane-body::-webkit-scrollbar-thumb { background: #d3d7e0; border-radius: 6px; border: 2px solid var(--jd-bg); }
 .jd-pane-body::-webkit-scrollbar-track { background: transparent; }
+
+
+
+
+/* ------ EXTRA --------- */
+import {
+  Component,
+  OnInit,
+  OnDestroy,
+  ViewChild,
+  ElementRef,
+  ChangeDetectionStrategy,
+  ChangeDetectorRef,
+  NgZone
+} from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { FormsModule } from '@angular/forms';
+import { Subject } from 'rxjs';
+import { takeUntil, debounceTime } from 'rxjs/operators';
+
+import { JsonDiffService } from './services/json-diff.service';
+import {
+  DiffRow,
+  RenderRow,
+  DiffStats,
+  CollapsedRow
+} from './models/diff.model';
+import { VirtualScrollDirective, VirtualScrollEvent } from './directives/virtual-scroll.directive';
+
+/**
+ * Optimized JSON Diff Viewer Component
+ * - Handles large JSON files with virtual scrolling
+ * - Supports any nesting depth
+ * - Synchronized scrolling between panels
+ * - Search and filter functionality
+ * - Memory efficient with proper cleanup
+ */
+@Component({
+  selector: 'app-json-diff-viewer',
+  standalone: true,
+  imports: [CommonModule, FormsModule, VirtualScrollDirective],
+  templateUrl: './json-diff-viewer.component.html',
+  styleUrls: ['./json-diff-viewer.component.css'],
+  changeDetection: ChangeDetectionStrategy.OnPush
+})
+export class JsonDiffViewerComponent implements OnInit, OnDestroy {
+  
+  @ViewChild('leftPanel', { static: false }) leftPanel?: ElementRef<HTMLDivElement>;
+  @ViewChild('rightPanel', { static: false }) rightPanel?: ElementRef<HTMLDivElement>;
+
+  // Configuration
+  readonly ROW_HEIGHT = 22; // pixels
+  readonly COLLAPSE_AFTER = 6;
+  readonly CONTEXT_LINES = 2;
+  readonly MAX_DEPTH = 100;
+  readonly VIRTUAL_SCROLL_BUFFER = 5; // Extra rows to render
+
+  // UI State
+  leftText: string = '';
+  rightText: string = '';
+  searchTerm: string = '';
+  
+  // Diff state
+  diffRows: DiffRow[] = [];
+  renderRows: RenderRow[] = [];
+  stats: DiffStats = {
+    total: 0,
+    unchanged: 0,
+    changed: 0,
+    added: 0,
+    removed: 0
+  };
+
+  // Scroll state
+  syncScroll = true;
+  leftVisibleRows: RenderRow[] = [];
+  rightVisibleRows: RenderRow[] = [];
+  leftScrollPercent = 0;
+  rightScrollPercent = 0;
+
+  // Processing state
+  isProcessing = false;
+  processingProgress = 0;
+  leftError: string | null = null;
+  rightError: string | null = null;
+  hasDiff = false;
+
+  // Expanded/collapsed state
+  expandedRuns = new Set<string>();
+
+  // Private
+  private destroy$ = new Subject<void>();
+  private diffSubject$ = new Subject<{ left: string; right: string }>();
+  private searchSubject$ = new Subject<string>();
+
+  // Sample data for demonstration
+  private readonly sampleLeft = {
+    'Aidan Gillen': {
+      array: ['Game of Thrones', 'The Wire'],
+      string: 'some string',
+      int: '2',
+      otherint: 4,
+      aboolean: 'true',
+      booleean: false,
+      null: null,
+      a_null: 88,
+      another_null: null,
+      object: { foo: 'bar' }
+    },
+    'Amy Ryan': ['In Treatment', 'The Wire'],
+    'Annie Fitzgerald': ['True Blood', 'Big Love', 'The Sopranos', 'Oz']
+  };
+
+  private readonly sampleRight = {
+    'Aidan Gillen': {
+      array: ['Game of Thrones', 'The Wire'],
+      string: 'some string',
+      int: 2,
+      aboolean: true,
+      booleean: true,
+      null: null,
+      a_null: null,
+      another_null: 'null check',
+      object: {
+        foo: 'bar',
+        object1: { new_prop1: 'new prop value' },
+        object2: { new_prop1: 'new prop value' }
+      }
+    },
+    'Amy Ryan': ['In Treatment', 'The Wire'],
+    'Annie Fitzgerald': ['True Blood', 'Big Love', 'The Sopranos'],
+    'Carol Chen': { array: ['Person of Interest'] }
+  };
+
+  constructor(
+    private diffService: JsonDiffService,
+    private cdr: ChangeDetectorRef,
+    private ngZone: NgZone
+  ) {}
+
+  ngOnInit(): void {
+    // Load sample data
+    this.loadSampleData();
+
+    // Setup diff calculation pipeline with debouncing
+    this.diffSubject$
+      .pipe(
+        debounceTime(300),
+        takeUntil(this.destroy$)
+      )
+      .subscribe(({ left, right }) => {
+        this.calculateDiff(left, right);
+      });
+
+    // Setup search pipeline
+    this.searchSubject$
+      .pipe(
+        debounceTime(200),
+        takeUntil(this.destroy$)
+      )
+      .subscribe(term => {
+        this.performSearch(term);
+      });
+
+    // Subscribe to diff stats
+    this.diffService
+      .getDiffStats()
+      .pipe(takeUntil(this.destroy$))
+      .subscribe(stats => {
+        this.stats = stats;
+        this.cdr.markForCheck();
+      });
+
+    // Subscribe to processing progress
+    this.diffService
+      .getProcessingProgress()
+      .pipe(takeUntil(this.destroy$))
+      .subscribe(progress => {
+        this.processingProgress = progress;
+        if (progress === 100) {
+          this.isProcessing = false;
+        }
+        this.cdr.markForCheck();
+      });
+  }
+
+  ngOnDestroy(): void {
+    this.destroy$.next();
+    this.destroy$.complete();
+    this.diffService.clearCache();
+  }
+
+  /**
+   * Load sample data
+   */
+  loadSampleData(): void {
+    this.leftText = JSON.stringify(this.sampleLeft, null, 2);
+    this.rightText = JSON.stringify(this.sampleRight, null, 2);
+    this.triggerDiff();
+  }
+
+  /**
+   * Trigger diff calculation (debounced)
+   */
+  triggerDiff(): void {
+    this.isProcessing = true;
+    this.processingProgress = 0;
+    this.diffSubject$.next({
+      left: this.leftText,
+      right: this.rightText
+    });
+  }
+
+  /**
+   * Calculate diff between two JSON strings
+   */
+  private calculateDiff(leftText: string, rightText: string): void {
+    this.ngZone.runOutsideAngular(() => {
+      try {
+        let leftJson: unknown;
+        let rightJson: unknown;
+
+        // Parse left JSON
+        try {
+          leftJson = JSON.parse(leftText);
+          this.leftError = null;
+        } catch (e) {
+          this.leftError = (e as Error).message;
+          this.hasDiff = false;
+          return;
+        }
+
+        // Parse right JSON
+        try {
+          rightJson = JSON.parse(rightText);
+          this.rightError = null;
+        } catch (e) {
+          this.rightError = (e as Error).message;
+          this.hasDiff = false;
+          return;
+        }
+
+        // Calculate diff
+        this.hasDiff = true;
+        this.diffRows = this.diffService.calculateDiff(leftJson, rightJson, {
+          collapseAfter: this.COLLAPSE_AFTER,
+          contextLines: this.CONTEXT_LINES,
+          maxDepth: this.MAX_DEPTH
+        });
+
+        this.expandedRuns.clear();
+        this.updateRenderRows();
+
+        this.ngZone.run(() => {
+          this.cdr.markForCheck();
+        });
+
+      } catch (error) {
+        console.error('Error calculating diff:', error);
+        this.hasDiff = false;
+      }
+    });
+  }
+
+  /**
+   * Update render rows (with collapsing)
+   */
+  private updateRenderRows(): void {
+    this.renderRows = this.diffService.collapseRows(
+      this.diffRows,
+      this.expandedRuns,
+      this.COLLAPSE_AFTER
+    );
+    
+    // Apply search filter if needed
+    if (this.searchTerm.trim()) {
+      this.renderRows = this.diffService.filterRows(this.renderRows, this.searchTerm);
+    }
+  }
+
+  /**
+   * Handle search input
+   */
+  onSearchChange(term: string): void {
+    this.searchTerm = term;
+    this.searchSubject$.next(term);
+  }
+
+  /**
+   * Perform search
+   */
+  private performSearch(term: string): void {
+    this.updateRenderRows();
+    this.cdr.markForCheck();
+  }
+
+  /**
+   * Handle left panel scroll
+   */
+  onLeftScroll(event: VirtualScrollEvent): void {
+    this.leftVisibleRows = this.getVisibleRows(event);
+    this.leftScrollPercent = event.scrollPercentage;
+
+    if (this.syncScroll && this.rightPanel) {
+      this.rightPanel.nativeElement.scrollTop = event.scrollOffset;
+    }
+
+    this.cdr.markForCheck();
+  }
+
+  /**
+   * Handle right panel scroll
+   */
+  onRightScroll(event: VirtualScrollEvent): void {
+    this.rightVisibleRows = this.getVisibleRows(event);
+    this.rightScrollPercent = event.scrollPercentage;
+
+    if (this.syncScroll && this.leftPanel) {
+      this.leftPanel.nativeElement.scrollTop = event.scrollOffset;
+    }
+
+    this.cdr.markForCheck();
+  }
+
+  /**
+   * Get visible rows from scroll event
+   */
+  private getVisibleRows(event: VirtualScrollEvent): RenderRow[] {
+    return this.renderRows.slice(event.startIndex, event.endIndex);
+  }
+
+  /**
+   * Toggle sync scroll
+   */
+  toggleSyncScroll(): void {
+    this.syncScroll = !this.syncScroll;
+    this.cdr.markForCheck();
+  }
+
+  /**
+   * Expand a collapsed run
+   */
+  expandRun(id: string): void {
+    this.expandedRuns.add(id);
+    this.updateRenderRows();
+    this.cdr.markForCheck();
+  }
+
+  /**
+   * Get row CSS class
+   */
+  getRowClass(row: RenderRow, side: 'left' | 'right'): string {
+    if (row.type === 'collapsed') {
+      return 'diff-row-collapsed';
+    }
+
+    const dRow = row as DiffRow;
+    let cls = 'diff-row';
+
+    if (dRow.type === 'equal') {
+      cls += ' diff-row-equal';
+    } else if (dRow.type === 'changed') {
+      cls += side === 'left' ? ' diff-row-removed diff-row-changed' : ' diff-row-added diff-row-changed';
+    } else if (dRow.type === 'removed') {
+      cls += ' diff-row-removed';
+    } else if (dRow.type === 'added') {
+      cls += ' diff-row-added';
+    }
+
+    return cls;
+  }
+
+  /**
+   * Get line number
+   */
+  getLineNum(row: RenderRow, side: 'left' | 'right'): number | null {
+    if (row.type === 'collapsed') return null;
+    const dRow = row as DiffRow;
+    return side === 'left' ? dRow.leftNum : dRow.rightNum;
+  }
+
+  /**
+   * Get cell text
+   */
+  getCellText(row: RenderRow, side: 'left' | 'right'): string {
+    if (row.type === 'collapsed') return '';
+    const dRow = row as DiffRow;
+    const cell = side === 'left' ? dRow.left : dRow.right;
+    return cell?.text || '';
+  }
+
+  /**
+   * Get cell tokens for syntax highlighting
+   */
+  getCellTokens(row: RenderRow, side: 'left' | 'right'): any[] {
+    if (row.type === 'collapsed') return [];
+    const dRow = row as DiffRow;
+    const cell = side === 'left' ? dRow.left : dRow.right;
+    return cell?.tokens || [];
+  }
+
+  /**
+   * Check if row is collapsed
+   */
+  isCollapsed(row: RenderRow): row is CollapsedRow {
+    return row.type === 'collapsed';
+  }
+
+  /**
+   * Format JSON
+   */
+  formatJson(): void {
+    try {
+      this.leftText = JSON.stringify(JSON.parse(this.leftText), null, 2);
+    } catch {
+      /* keep as-is */
+    }
+
+    try {
+      this.rightText = JSON.stringify(JSON.parse(this.rightText), null, 2);
+    } catch {
+      /* keep as-is */
+    }
+
+    this.triggerDiff();
+  }
+
+  /**
+   * Export diff report
+   */
+  exportDiff(): void {
+    const report = this.diffRows
+      .filter((r): r is DiffRow => r.type !== 'equal')
+      .map(r => {
+        if (r.type === 'changed') {
+          return `~ ${r.left!.text.trim()}  ->  ${r.right!.text.trim()}`;
+        }
+        if (r.type === 'removed') {
+          return `- ${r.left!.text.trim()}`;
+        }
+        return `+ ${r.right!.text.trim()}`;
+      })
+      .join('\n');
+
+    const blob = new Blob([report], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'json-diff-report.txt';
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  /**
+   * Track by function for ngFor performance
+   */
+  trackByIndex(index: number): number {
+    return index;
+  }
+
+  /**
+   * Get progress percentage
+   */
+  getProgressPercent(): string {
+    return `${this.processingProgress}%`;
+  }
+}
+
+
+
+
+
+
+import { Injectable } from '@angular/core';
+import { BehaviorSubject, Observable } from 'rxjs';
+
+/**
+ * Token interface for syntax highlighting
+ */
+export interface Token {
+  text: string;
+  cls: string | null;
+}
+
+/**
+ * Represents a single line in the formatted JSON
+ */
+export interface JsonLine {
+  text: string;
+  path: (string | number)[];
+  depth: number;
+  tokens: Token[];
+  lineNum?: number;
+}
+
+/**
+ * Diff operation from Myers algorithm
+ */
+export interface DiffOp {
+  type: 'equal' | 'insert' | 'delete';
+  aIndex: number;
+  bIndex: number;
+}
+
+/**
+ * A single diff row with line info
+ */
+export interface DiffRow {
+  type: 'equal' | 'changed' | 'added' | 'removed';
+  left: JsonLine | null;
+  right: JsonLine | null;
+  leftNum: number | null;
+  rightNum: number | null;
+}
+
+/**
+ * Collapsed row for hiding long equal runs
+ */
+export interface CollapsedRow {
+  type: 'collapsed';
+  id: string;
+  count: number;
+  startIdx: number;
+}
+
+export type RenderRow = DiffRow | CollapsedRow;
+
+/**
+ * Diff statistics
+ */
+export interface DiffStats {
+  total: number;
+  unchanged: number;
+  changed: number;
+  added: number;
+  removed: number;
+}
+
+/**
+ * Configuration for diff processing
+ */
+export interface DiffConfig {
+  collapseAfter?: number;
+  contextLines?: number;
+  maxDepth?: number;
+}
+
+/**
+ * High-performance diff service optimized for large JSON
+ */
+@Injectable({
+  providedIn: 'root'
+})
+export class JsonDiffService {
+  
+  // Configuration
+  private readonly COLLAPSE_AFTER = 6;
+  private readonly CONTEXT_LINES = 2;
+  private readonly MAX_DEPTH = 100;
+  
+  // Caches for performance
+  private lineCache = new Map<string, JsonLine[]>();
+  private diffCache = new Map<string, DiffRow[]>();
+  private tokenCache = new Map<string, Token[]>();
+  
+  // Observable streams
+  private diffStats$ = new BehaviorSubject<DiffStats>({
+    total: 0,
+    unchanged: 0,
+    changed: 0,
+    added: 0,
+    removed: 0
+  });
+  
+  private processingProgress$ = new BehaviorSubject<number>(0);
+
+  constructor() {}
+
+  /**
+   * Get diff statistics observable
+   */
+  getDiffStats(): Observable<DiffStats> {
+    return this.diffStats$.asObservable();
+  }
+
+  /**
+   * Get processing progress observable (0-100)
+   */
+  getProcessingProgress(): Observable<number> {
+    return this.processingProgress$.asObservable();
+  }
+
+  /**
+   * Clear all caches
+   */
+  clearCache(): void {
+    this.lineCache.clear();
+    this.diffCache.clear();
+    this.tokenCache.clear();
+  }
+
+  /**
+   * Calculate diff between two JSON objects
+   * Optimized for large datasets with memory efficiency
+   */
+  calculateDiff(left: unknown, right: unknown, config?: DiffConfig): DiffRow[] {
+    const cfg: DiffConfig = {
+      collapseAfter: config?.collapseAfter ?? this.COLLAPSE_AFTER,
+      contextLines: config?.contextLines ?? this.CONTEXT_LINES,
+      maxDepth: config?.maxDepth ?? this.MAX_DEPTH
+    };
+
+    try {
+      this.processingProgress$.next(10);
+
+      // Format JSON to lines
+      const leftLines = this.jsonToLines(left, cfg.maxDepth!);
+      this.processingProgress$.next(30);
+
+      const rightLines = this.jsonToLines(right, cfg.maxDepth!);
+      this.processingProgress$.next(50);
+
+      // Get text arrays for diff algorithm
+      const leftTexts = leftLines.map(l => l.text);
+      const rightTexts = rightLines.map(l => l.text);
+
+      // Run diff algorithm
+      const ops = this.myersDiff(leftTexts, rightTexts);
+      this.processingProgress$.next(70);
+
+      // Build rows from operations
+      const rows = this.buildRows(ops, leftLines, rightLines);
+      this.processingProgress$.next(90);
+
+      // Calculate stats
+      this.updateStats(rows);
+      this.processingProgress$.next(100);
+
+      return rows;
+    } catch (error) {
+      console.error('Error in calculateDiff:', error);
+      this.processingProgress$.next(100);
+      return [];
+    }
+  }
+
+  /**
+   * Convert JSON to array of lines with caching
+   * Handles deep nesting efficiently
+   */
+  private jsonToLines(value: unknown, maxDepth: number): JsonLine[] {
+    const cacheKey = JSON.stringify(value).substring(0, 100);
+    
+    // Check cache
+    if (this.lineCache.has(cacheKey)) {
+      return this.lineCache.get(cacheKey)!;
+    }
+
+    const lines: JsonLine[] = [];
+
+    const push = (text: string, path: (string | number)[], depth: number) => {
+      if (depth <= maxDepth) {
+        lines.push({
+          text,
+          path,
+          depth,
+          tokens: this.tokenizeLineWithCache(text)
+        });
+      }
+    };
+
+    const walk = (
+      val: any,
+      depth: number,
+      path: (string | number)[],
+      isLast: boolean,
+      key: string | number | undefined
+    ): void => {
+      // Stop at max depth
+      if (depth > maxDepth) {
+        push(`${' '.repeat(depth * 2)}[max depth reached]`, path, depth);
+        return;
+      }
+
+      const indent = ' '.repeat(depth * 2);
+      const keyStr = key !== undefined ? `"${key}": ` : '';
+      const comma = isLast ? '' : ',';
+
+      if (val === null || typeof val !== 'object') {
+        push(`${indent}${keyStr}${JSON.stringify(val)}${comma}`, path, depth);
+        return;
+      }
+
+      const isArray = Array.isArray(val);
+      const entries: [string | number, any][] = isArray
+        ? val.map((v: any, i: number) => [i, v])
+        : Object.entries(val);
+
+      if (entries.length === 0) {
+        push(`${indent}${keyStr}${isArray ? '[]' : '{}'}${comma}`, path, depth);
+        return;
+      }
+
+      push(`${indent}${keyStr}${isArray ? '[' : '{'}`, path, depth);
+
+      entries.forEach(([k, v], idx) => {
+        const childIsLast = idx === entries.length - 1;
+        const childPath = [...path, k];
+        walk(v, depth + 1, childPath, childIsLast, isArray ? undefined : k);
+      });
+
+      push(`${indent}${isArray ? ']' : '}'}${comma}`, path, depth);
+    };
+
+    try {
+      walk(value, 0, [], true, undefined);
+    } catch (error) {
+      console.error('Error walking JSON:', error);
+    }
+
+    // Cache result
+    if (cacheKey) {
+      this.lineCache.set(cacheKey, lines);
+    }
+
+    return lines;
+  }
+
+  /**
+   * Tokenize line with caching for performance
+   */
+  private tokenizeLineWithCache(text: string): Token[] {
+    if (this.tokenCache.has(text)) {
+      return this.tokenCache.get(text)!;
+    }
+
+    const tokens = this.tokenizeLine(text);
+    
+    if (text.length < 500) { // Only cache reasonable-sized lines
+      this.tokenCache.set(text, tokens);
+    }
+
+    return tokens;
+  }
+
+  /**
+   * Tokenize a single line for syntax highlighting
+   */
+  private tokenizeLine(text: string): Token[] {
+    const tokens: Token[] = [];
+    const regex = /("(?:[^"\\]|\\.)*")(\s*:)|("(?:[^"\\]|\\.)*")|(-?\d+\.?\d*)|(true|false)|(null)|([{}[\]])/g;
+    let lastIndex = 0;
+    let m: RegExpExecArray | null;
+
+    while ((m = regex.exec(text)) !== null) {
+      if (m.index > lastIndex) {
+        tokens.push({ text: text.slice(lastIndex, m.index), cls: null });
+      }
+
+      if (m[1] !== undefined) {
+        tokens.push({ text: m[1], cls: 'jd-key' });
+        tokens.push({ text: m[2], cls: null });
+      } else if (m[3] !== undefined) {
+        tokens.push({ text: m[3], cls: 'jd-str' });
+      } else if (m[4] !== undefined) {
+        tokens.push({ text: m[4], cls: 'jd-num' });
+      } else if (m[5] !== undefined) {
+        tokens.push({ text: m[5], cls: 'jd-bool' });
+      } else if (m[6] !== undefined) {
+        tokens.push({ text: m[6], cls: 'jd-null' });
+      } else if (m[7] !== undefined) {
+        tokens.push({ text: m[7], cls: 'jd-brace' });
+      }
+
+      lastIndex = regex.lastIndex;
+    }
+
+    if (lastIndex < text.length) {
+      tokens.push({ text: text.slice(lastIndex), cls: null });
+    }
+
+    return tokens;
+  }
+
+  /**
+   * Myers O(ND) diff algorithm - optimized version
+   * Handles large arrays efficiently
+   */
+  private myersDiff(a: string[], b: string[]): DiffOp[] {
+    const N = a.length;
+    const M = b.length;
+
+    // Quick exit for empty arrays
+    if (N === 0 && M === 0) return [];
+    if (N === 0) return b.map((_, i) => ({ type: 'insert', aIndex: -1, bIndex: i }));
+    if (M === 0) return a.map((_, i) => ({ type: 'delete', aIndex: i, bIndex: -1 }));
+
+    const MAX = N + M || 1;
+    const v: Record<number, number> = { 1: 0 };
+    const trace: Record<number, number>[] = [];
+
+    // Myers algorithm
+    outerLoop: for (let d = 0; d <= MAX && d <= 1000; d++) { // Limit iterations for safety
+      trace.push({ ...v });
+
+      for (let k = -d; k <= d; k += 2) {
+        let x: number;
+
+        if (k === -d || (k !== d && v[k - 1] < v[k + 1])) {
+          x = v[k + 1];
+        } else {
+          x = v[k - 1] + 1;
+        }
+
+        let y = x - k;
+
+        while (x < N && y < M && a[x] === b[y]) {
+          x++;
+          y++;
+        }
+
+        v[k] = x;
+
+        if (x >= N && y >= M) {
+          break outerLoop;
+        }
+      }
+    }
+
+    // Backtrack to get operations
+    return this.backtrackDiff(trace, a, b, N, M);
+  }
+
+  /**
+   * Backtrack through Myers trace to build operations list
+   */
+  private backtrackDiff(
+    trace: Record<number, number>[],
+    a: string[],
+    b: string[],
+    N: number,
+    M: number
+  ): DiffOp[] {
+    let x = N;
+    let y = M;
+    const ops: DiffOp[] = [];
+
+    for (let d = trace.length - 1; d >= 0; d--) {
+      const vv = trace[d];
+      const k = x - y;
+      const prevK = k === -d || (k !== d && vv[k - 1] < vv[k + 1]) ? k + 1 : k - 1;
+      const prevX = vv[prevK];
+      const prevY = prevX - prevK;
+
+      while (x > prevX && y > prevY) {
+        ops.push({ type: 'equal', aIndex: x - 1, bIndex: y - 1 });
+        x--;
+        y--;
+      }
+
+      if (d > 0) {
+        if (x === prevX) {
+          ops.push({ type: 'insert', aIndex: -1, bIndex: prevY });
+        } else {
+          ops.push({ type: 'delete', aIndex: prevX, bIndex: -1 });
+        }
+      }
+
+      x = prevX;
+      y = prevY;
+    }
+
+    return ops.reverse();
+  }
+
+  /**
+   * Build diff rows from operations
+   */
+  private buildRows(ops: DiffOp[], leftLines: JsonLine[], rightLines: JsonLine[]): DiffRow[] {
+    const rows: DiffRow[] = [];
+    let delBuf: DiffOp[] = [];
+    let insBuf: DiffOp[] = [];
+
+    const flush = () => {
+      const pairCount = Math.min(delBuf.length, insBuf.length);
+
+      for (let i = 0; i < pairCount; i++) {
+        rows.push({
+          type: 'changed',
+          left: leftLines[delBuf[i].aIndex],
+          right: rightLines[insBuf[i].bIndex],
+          leftNum: null,
+          rightNum: null
+        });
+      }
+
+      for (let i = pairCount; i < delBuf.length; i++) {
+        rows.push({
+          type: 'removed',
+          left: leftLines[delBuf[i].aIndex],
+          right: null,
+          leftNum: null,
+          rightNum: null
+        });
+      }
+
+      for (let i = pairCount; i < insBuf.length; i++) {
+        rows.push({
+          type: 'added',
+          left: null,
+          right: rightLines[insBuf[i].bIndex],
+          leftNum: null,
+          rightNum: null
+        });
+      }
+
+      delBuf = [];
+      insBuf = [];
+    };
+
+    for (const op of ops) {
+      if (op.type === 'equal') {
+        flush();
+        rows.push({
+          type: 'equal',
+          left: leftLines[op.aIndex],
+          right: rightLines[op.bIndex],
+          leftNum: null,
+          rightNum: null
+        });
+      } else if (op.type === 'delete') {
+        delBuf.push(op);
+      } else {
+        insBuf.push(op);
+      }
+    }
+
+    flush();
+
+    // Assign line numbers
+    let leftNum = 0;
+    let rightNum = 0;
+
+    for (const row of rows) {
+      if (row.left) row.leftNum = ++leftNum;
+      if (row.right) row.rightNum = ++rightNum;
+    }
+
+    return rows;
+  }
+
+  /**
+   * Collapse long runs of equal lines
+   */
+  collapseRows(rows: DiffRow[], expandedRuns: Set<string>, collapseAfter: number = this.COLLAPSE_AFTER): RenderRow[] {
+    const out: RenderRow[] = [];
+    let i = 0;
+
+    while (i < rows.length) {
+      if (rows[i].type === 'equal') {
+        let j = i;
+
+        while (j < rows.length && rows[j].type === 'equal') {
+          j++;
+        }
+
+        const runLen = j - i;
+        const id = `run-${i}`;
+
+        if (runLen > collapseAfter && !expandedRuns.has(id)) {
+          // Add context lines before collapsed section
+          for (let c = 0; c < this.CONTEXT_LINES && i + c < j; c++) {
+            out.push(rows[i + c]);
+          }
+
+          // Add collapsed marker
+          out.push({
+            type: 'collapsed',
+            id,
+            count: runLen - this.CONTEXT_LINES * 2,
+            startIdx: i + this.CONTEXT_LINES
+          });
+
+          // Add context lines after collapsed section
+          for (let c = Math.max(this.CONTEXT_LINES, runLen - this.CONTEXT_LINES); c < runLen; c++) {
+            out.push(rows[i + c]);
+          }
+        } else {
+          // Don't collapse short runs
+          for (let c = i; c < j; c++) {
+            out.push(rows[c]);
+          }
+        }
+
+        i = j;
+      } else {
+        out.push(rows[i]);
+        i++;
+      }
+    }
+
+    return out;
+  }
+
+  /**
+   * Filter rows by search term
+   */
+  filterRows(rows: RenderRow[], searchTerm: string): RenderRow[] {
+    if (!searchTerm.trim()) {
+      return rows;
+    }
+
+    const term = searchTerm.toLowerCase();
+    return rows.filter(row => {
+      if (row.type === 'collapsed') return false;
+
+      const dRow = row as DiffRow;
+      const leftText = dRow.left?.text?.toLowerCase() || '';
+      const rightText = dRow.right?.text?.toLowerCase() || '';
+
+      return leftText.includes(term) || rightText.includes(term);
+    });
+  }
+
+  /**
+   * Update diff statistics
+   */
+  private updateStats(rows: DiffRow[]): void {
+    let changed = 0;
+    let added = 0;
+    let removed = 0;
+    let unchanged = 0;
+
+    rows.forEach(row => {
+      switch (row.type) {
+        case 'changed':
+          changed++;
+          break;
+        case 'added':
+          added++;
+          break;
+        case 'removed':
+          removed++;
+          break;
+        case 'equal':
+          unchanged++;
+          break;
+      }
+    });
+
+    const stats: DiffStats = {
+      total: rows.length,
+      unchanged,
+      changed,
+      added,
+      removed
+    };
+
+    this.diffStats$.next(stats);
+  }
+
+  /**
+   * Get current stats
+   */
+  getCurrentStats(): DiffStats {
+    return this.diffStats$.value;
+  }
+
+  /**
+   * Highlight JSON syntax in HTML
+   */
+  highlightJSON(text: string): string {
+    const tokens = this.tokenizeLine(text);
+    return tokens
+      .map(t => {
+        if (!t.cls) return this.escapeHtml(t.text);
+        return `<span class="${t.cls}">${this.escapeHtml(t.text)}</span>`;
+      })
+      .join('');
+  }
+
+  /**
+   * Escape HTML special characters
+   */
+  private escapeHtml(text: string): string {
+    const map: Record<string, string> = {
+      '&': '&amp;',
+      '<': '&lt;',
+      '>': '&gt;',
+      '"': '&quot;',
+      "'": '&#039;'
+    };
+    return text.replace(/[&<>"']/g, c => map[c]);
+  }
+}
+
+
+
+
+
+
+/**
+ * Token interface for syntax highlighting
+ */
+export interface Token {
+  text: string;
+  cls: string | null;
+}
+
+/**
+ * Represents a single line in the formatted JSON
+ */
+export interface JsonLine {
+  text: string;
+  path: (string | number)[];
+  depth: number;
+  tokens: Token[];
+  lineNum?: number;
+}
+
+/**
+ * Diff operation type
+ */
+export type DiffOpType = 'equal' | 'insert' | 'delete';
+
+/**
+ * Diff operation from Myers algorithm
+ */
+export interface DiffOp {
+  type: DiffOpType;
+  aIndex: number;
+  bIndex: number;
+}
+
+/**
+ * Row status type
+ */
+export type DiffRowStatus = 'equal' | 'changed' | 'added' | 'removed';
+
+/**
+ * A single diff row with line info
+ */
+export interface DiffRow {
+  type: DiffRowStatus;
+  left: JsonLine | null;
+  right: JsonLine | null;
+  leftNum: number | null;
+  rightNum: number | null;
+}
+
+/**
+ * Collapsed row for hiding long equal runs
+ */
+export interface CollapsedRow {
+  type: 'collapsed';
+  id: string;
+  count: number;
+  startIdx: number;
+}
+
+/**
+ * Render row can be either a diff row or collapsed row
+ */
+export type RenderRow = DiffRow | CollapsedRow;
+
+/**
+ * Diff statistics
+ */
+export interface DiffStats {
+  total: number;
+  unchanged: number;
+  changed: number;
+  added: number;
+  removed: number;
+}
+
+/**
+ * Virtual scroll context
+ */
+export interface VirtualScrollContext {
+  startIdx: number;
+  endIdx: number;
+  offsetPixels: number;
+}
+
+/**
+ * Search match result
+ */
+export interface SearchMatch {
+  rowIdx: number;
+  text: string;
+  side: 'left' | 'right';
+}
+
+/**
+ * Hunk/section info for navigation
+ */
+export interface Hunk {
+  startIdx: number;
+  endIdx: number;
+  type: 'added' | 'removed' | 'changed';
+  affectedLines: number;
+}
+
+/**
+ * Component state for JSON diff viewer
+ */
+export interface JsonDiffViewerState {
+  leftJson: string;
+  rightJson: string;
+  rows: DiffRow[];
+  renderRows: RenderRow[];
+  stats: DiffStats;
+  searchTerm: string;
+  selectedRowIdx: number | null;
+  expandedRuns: Set<string>;
+  syncScroll: boolean;
+  showOnlyDiffs: boolean;
+  leftError: string | null;
+  rightError: string | null;
+  isProcessing: boolean;
+  processingProgress: number;
+}
+
+/**
+ * Configuration for diff processing
+ */
+export interface DiffConfig {
+  collapseAfter?: number;
+  contextLines?: number;
+  maxDepth?: number;
+  maxLinesForVirtualScroll?: number;
+}
+
+/**
+ * Virtual scroll event
+ */
+export interface VirtualScrollEvent {
+  firstVisibleIndex: number;
+  lastVisibleIndex: number;
+  visibleRange: { start: number; end: number };
+  containerSize: number;
+  contentSize: number;
+  scrolledPercentage: number;
+}
+
+
+
+
+
+import {
+  Directive,
+  ElementRef,
+  EventEmitter,
+  Input,
+  Output,
+  OnInit,
+  OnDestroy,
+  NgZone,
+  ChangeDetectorRef
+} from '@angular/core';
+import { Subject } from 'rxjs';
+import { debounceTime, takeUntil } from 'rxjs/operators';
+
+export interface VirtualScrollEvent {
+  startIndex: number;
+  endIndex: number;
+  scrollOffset: number;
+  scrollPercentage: number;
+}
+
+/**
+ * Virtual scroll directive for efficient rendering of large lists
+ * Renders only visible rows to improve performance significantly
+ * 
+ * Usage:
+ * <div appVirtualScroll [items]="items" [itemHeight]="22" (scrolled)="onScroll($event)">
+ *   <div *ngFor="let item of visibleItems">{{ item }}</div>
+ * </div>
+ */
+@Directive({
+  selector: '[appVirtualScroll]',
+  standalone: true
+})
+export class VirtualScrollDirective implements OnInit, OnDestroy {
+  @Input() items: any[] = [];
+  @Input() itemHeight: number = 22; // Fixed row height in pixels
+  @Input() bufferSize: number = 5; // Extra rows to render outside viewport
+  @Input() debounceTime: number = 16; // Debounce scroll events (roughly 60fps)
+
+  @Output() scrolled = new EventEmitter<VirtualScrollEvent>();
+  @Output() visibleItemsChanged = new EventEmitter<any[]>();
+
+  // Visible items
+  visibleItems: any[] = [];
+  visibleItemsSet: Set<any> = new Set();
+
+  private destroy$ = new Subject<void>();
+  private scrollSubject = new Subject<Event>();
+  private containerHeight = 0;
+  private scrollTop = 0;
+  private totalHeight = 0;
+
+  constructor(
+    private el: ElementRef,
+    private ngZone: NgZone,
+    private cdr: ChangeDetectorRef
+  ) {}
+
+  ngOnInit(): void {
+    // Get container element
+    const container = this.el.nativeElement as HTMLElement;
+
+    // Set up scroll listener outside Angular zone for performance
+    this.ngZone.runOutsideAngular(() => {
+      container.addEventListener('scroll', (event) => {
+        this.scrollSubject.next(event);
+      });
+
+      // Debounced scroll handler
+      this.scrollSubject
+        .pipe(
+          debounceTime(this.debounceTime),
+          takeUntil(this.destroy$)
+        )
+        .subscribe(() => {
+          this.onScroll();
+        });
+    });
+
+    // Initial calculation
+    this.updateContainerHeight();
+    this.updateVisibleItems();
+
+    // Handle resize
+    window.addEventListener('resize', () => this.updateContainerHeight());
+  }
+
+  ngOnDestroy(): void {
+    this.destroy$.next();
+    this.destroy$.complete();
+  }
+
+  /**
+   * Update container height
+   */
+  private updateContainerHeight(): void {
+    const container = this.el.nativeElement as HTMLElement;
+    this.containerHeight = container.clientHeight;
+    this.totalHeight = this.items.length * this.itemHeight;
+    this.updateVisibleItems();
+  }
+
+  /**
+   * Handle scroll event
+   */
+  private onScroll(): void {
+    const container = this.el.nativeElement as HTMLElement;
+    this.scrollTop = container.scrollTop;
+    this.updateVisibleItems();
+  }
+
+  /**
+   * Update visible items based on scroll position
+   */
+  private updateVisibleItems(): void {
+    if (!this.items.length || !this.containerHeight) {
+      this.visibleItems = [];
+      this.visibleItemsSet.clear();
+      return;
+    }
+
+    // Calculate visible range
+    let startIndex = Math.max(0, Math.floor(this.scrollTop / this.itemHeight) - this.bufferSize);
+    let endIndex = Math.min(
+      this.items.length,
+      Math.ceil((this.scrollTop + this.containerHeight) / this.itemHeight) + this.bufferSize
+    );
+
+    // Update visible items
+    const newVisibleItems = this.items.slice(startIndex, endIndex);
+    
+    // Only update if changed (avoid unnecessary change detection)
+    if (newVisibleItems.length !== this.visibleItems.length ||
+        !newVisibleItems.every((item, i) => item === this.visibleItems[i])) {
+      
+      this.ngZone.run(() => {
+        this.visibleItems = newVisibleItems;
+        this.visibleItemsSet.clear();
+        newVisibleItems.forEach(item => this.visibleItemsSet.add(item));
+        this.cdr.markForCheck();
+        this.visibleItemsChanged.emit(newVisibleItems);
+      });
+    }
+
+    // Emit scroll event
+    const scrollPercentage = this.scrollTop / (this.totalHeight - this.containerHeight);
+    this.scrolled.emit({
+      startIndex,
+      endIndex,
+      scrollOffset: this.scrollTop,
+      scrollPercentage: Math.max(0, Math.min(1, scrollPercentage))
+    });
+  }
+
+  /**
+   * Scroll to a specific index
+   */
+  scrollToIndex(index: number, smooth = true): void {
+    const container = this.el.nativeElement as HTMLElement;
+    const targetScrollTop = index * this.itemHeight;
+
+    if (smooth) {
+      container.scrollTo({
+        top: targetScrollTop,
+        behavior: 'smooth'
+      });
+    } else {
+      container.scrollTop = targetScrollTop;
+    }
+  }
+
+  /**
+   * Scroll to a specific item
+   */
+  scrollToItem(item: any, smooth = true): void {
+    const index = this.items.indexOf(item);
+    if (index !== -1) {
+      this.scrollToIndex(index, smooth);
+    }
+  }
+
+  /**
+   * Check if item is visible
+   */
+  isItemVisible(item: any): boolean {
+    return this.visibleItemsSet.has(item);
+  }
+
+  /**
+   * Get content height for spacer
+   */
+  getContentHeight(): number {
+    return this.totalHeight;
+  }
+
+  /**
+   * Get offset height for spacer
+   */
+  getOffsetHeight(): number {
+    const container = this.el.nativeElement as HTMLElement;
+    const topIndex = Math.floor(this.scrollTop / this.itemHeight);
+    return topIndex * this.itemHeight;
+  }
+}
